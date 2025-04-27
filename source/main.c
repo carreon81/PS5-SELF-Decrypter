@@ -319,7 +319,7 @@ void *self_decrypt_block(
     }
 
     // Request segment decryption
-    for (int tries = 0; tries < 5; tries++) {
+    for (int tries = 0; tries < 20; tries++) {
         err = _sceSblAuthMgrSmLoadSelfBlock(
             sock,
             authmgr_handle,
@@ -334,7 +334,7 @@ void *self_decrypt_block(
         if (err == 0)
             break;
 
-        usleep(100000);
+        usleep(50000);
     }
 
     if (err != 0)
@@ -572,10 +572,20 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
                 offsets
             );
 
+            // if (block_data[block] == NULL) {
+            //     SOCK_LOG(sock, "[!] failed to decrypt block %d\n", block);
+            //     err = -11;
+            //     goto cleanup_out_file_data;
+            // }
             if (block_data[block] == NULL) {
-                SOCK_LOG(sock, "[!] failed to decrypt block %d\n", block);
-                err = -11;
-                goto cleanup_out_file_data;
+                SOCK_LOG(sock, "[!] failed to decrypt block %d, filling with 0x00\n", block);
+                void *out_addr = out_file_data + cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment));
+                if (block == block_info->block_count - 1) {
+                    memset(out_addr, 0x00, tail_block_size);
+                } else {
+                    memset(out_addr, 0x00, SELF_SEGMENT_BLOCK_SIZE(segment));
+                }
+                continue;
             }
 
             // Copy block to output buffer
