@@ -21,7 +21,7 @@
 #include "elf.h"
 
 #ifdef LOG_TO_SOCKET
-#define PC_IP   "10.0.3.3"
+#define PC_IP   "192.168.0.134"
 #define PC_PORT 5655
 #endif
 struct tailored_offsets
