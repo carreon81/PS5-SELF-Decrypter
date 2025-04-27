@@ -50,6 +50,8 @@ uint64_t g_bump_allocator_len;
 char *g_dump_queue_buf = NULL;
 int g_dump_queue_buf_pos = 0;
 #define G_DUMP_QUEUE_BUF_SIZE 1 * 1024 * 1024 // 1MB
+#define MAX_FAILED_BLOCKS 10
+
 
 void *bump_alloc(uint64_t len)
 {
@@ -357,89 +359,67 @@ void *self_decrypt_block(
 
 int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, struct tailored_offsets *offsets)
 {
-    int err;
+    int err = 0;
     int service_id;
     int written_bytes;
     int self_file_fd;
     struct stat self_file_stat;
-    void *self_file_data;
-    void *out_file_data;
+    void *self_file_data = NULL;
+    void *out_file_data = NULL;
     struct elf64_hdr *elf_header;
     struct elf64_phdr *start_phdrs;
     struct elf64_phdr *cur_phdr;
     struct sce_self_header *header;
     struct sce_self_segment_header *segment;
     struct sce_self_segment_header *target_segment;
-    struct self_block_segment **block_segments;
+    struct self_block_segment **block_segments = NULL;
     struct self_block_segment *block_info;
-    void **block_data;
+    void **block_data = NULL;
     uint64_t tail_block_size;
-    uint64_t final_file_size;
+    uint64_t final_file_size = 0;
 
-    err = 0;
-
-    // Open SELF file for reading
-    self_file_fd = open(path, 0, 0);
+    self_file_fd = open(path, O_RDONLY, 0);
     if (self_file_fd < 0) {
         SOCK_LOG(sock, "[!] failed to open %s\n", path);
         close(out_fd);
-        return self_file_fd;
+        return -1;
     }
 
     fstat(self_file_fd, &self_file_stat);
-    self_file_data = mmap(NULL, self_file_stat.st_size, PROT_READ, MAP_SHARED, self_file_fd, 0);
-    if (self_file_data == NULL || self_file_data == MAP_FAILED) {
-        SOCK_LOG(sock, "[!] file mmap failed, failling back to reading the file\n");
-        // some games give errno 12, but reading in the file works, weird
-        self_file_data = mmap(NULL, self_file_stat.st_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-        size_t total_read = 0;
-        while (total_read < self_file_stat.st_size) {
-            size_t read_bytes = read(self_file_fd, self_file_data + total_read, self_file_stat.st_size - total_read);
-            if (read_bytes == 0) {
-                break;
-            } else if (read_bytes < 0) {
-                SOCK_LOG(sock, "[!] failed to read %s\n", path);
-                err = -30;
-                goto cleanup_in_file_data;
-            }
 
-            total_read += read_bytes;
-        }
-        SOCK_LOG(sock, "[+] read file into memory\n");
+    // Alocamos buffer manualmente y leemos
+    self_file_data = mmap(NULL, self_file_stat.st_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (self_file_data == MAP_FAILED || self_file_data == NULL) {
+        SOCK_LOG(sock, "[!] mmap failed\n");
+        err = -2;
+        goto cleanup;
     }
 
-    // if (*(uint32_t *) (self_file_data) != SELF_PROSPERO_MAGIC) {
-    //     SOCK_LOG(sock, "[!] %s is not a PS5 SELF file\n", path);
-    //     err = -22;
-    //     goto cleanup_in_file_data;
-    // }
+    size_t total_read = 0;
+    while (total_read < self_file_stat.st_size) {
+        ssize_t r = read(self_file_fd, self_file_data + total_read, self_file_stat.st_size - total_read);
+        if (r <= 0) {
+            SOCK_LOG(sock, "[!] read failed\n");
+            err = -3;
+            goto cleanup;
+        }
+        total_read += r;
+    }
 
     SOCK_LOG(sock, "[+] decrypting %s...\n", path);
 
-    // Verify SELF header and get a context handle
-    header = (struct sce_self_header *) self_file_data;
-    service_id = self_verify_header(
-        sock,
-        authmgr_handle,
-        self_file_data,
-        header->header_size + header->metadata_size,
-        offsets);
-
+    header = (struct sce_self_header *)self_file_data;
+    service_id = self_verify_header(sock, authmgr_handle, self_file_data, header->header_size + header->metadata_size, offsets);
     if (service_id < 0) {
-        SOCK_LOG(sock, "[!] failed to acquire a service ID\n");
-        err = -1;
-        goto cleanup_in_file_data;
+        SOCK_LOG(sock, "[!] failed to acquire service ID\n");
+        err = -4;
+        goto cleanup;
     }
 
-    // Get ELF headers
-    elf_header  = (struct elf64_hdr *) (self_file_data + sizeof(struct sce_self_header) +
-                    (sizeof(struct sce_self_segment_header) * header->segment_count));
-    start_phdrs = (struct elf64_phdr *) ((char *) (elf_header) + sizeof(struct elf64_hdr));
+    elf_header = (struct elf64_hdr *)(self_file_data + sizeof(struct sce_self_header) + (sizeof(struct sce_self_segment_header) * header->segment_count));
+    start_phdrs = (struct elf64_phdr *)((char *)elf_header + sizeof(struct elf64_hdr));
 
-    // Allocate backing buffer for output file data. We'll get size by finding the NOTE program header which should be
-    // in most SELFs
     cur_phdr = start_phdrs;
-    final_file_size = 0;
     for (int i = 0; i < elf_header->e_phnum; i++) {
         if (cur_phdr->p_type == PT_NOTE)
             final_file_size = cur_phdr->p_offset + cur_phdr->p_filesz;
@@ -447,9 +427,6 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
     }
 
     if (final_file_size == 0) {
-        // Second chance: fallback on latest LOAD segment size
-        SOCK_LOG(sock, "  [?] file segments are irregular, falling back on last LOAD segment\n");
-
         cur_phdr = start_phdrs;
         for (int i = 0; i < elf_header->e_phnum; i++) {
             if (cur_phdr->p_type == PT_LOAD)
@@ -458,175 +435,105 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
         }
     }
 
-    out_file_data = mmap(NULL, final_file_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (out_file_data == NULL || (intptr_t)out_file_data == -1) {
-        err = -12;
-        goto cleanup_in_file_data;
+    if (final_file_size == 0) {
+        SOCK_LOG(sock, "[!] cannot determine final file size\n");
+        err = -5;
+        goto cleanup;
     }
 
-    // Copy ELF headers over
+    out_file_data = mmap(NULL, final_file_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (out_file_data == MAP_FAILED || out_file_data == NULL) {
+        SOCK_LOG(sock, "[!] failed to alloc output buffer\n");
+        err = -6;
+        goto cleanup;
+    }
+
     memcpy(out_file_data, elf_header, sizeof(struct elf64_hdr));
     memcpy(out_file_data + sizeof(struct elf64_hdr), start_phdrs, elf_header->e_phnum * sizeof(struct elf64_phdr));
 
-    // Digest
-    memcpy(
-        out_file_data + sizeof(struct elf64_hdr) + (elf_header->e_phnum * sizeof(struct elf64_phdr)),
-        (char *) (start_phdrs) + (elf_header->e_phnum * sizeof(struct elf64_phdr)),
-        0x40
-    );
-
-    // Allocate array to hold block info
     block_segments = bump_calloc(header->segment_count, sizeof(struct self_block_segment *));
     if (block_segments == NULL) {
-        err = -12;
-        goto cleanup_out_file_data;
+        err = -7;
+        goto cleanup;
     }
 
-    // Decrypt block info segments
     for (int i = 0; i < header->segment_count; i++) {
-        segment = (struct sce_self_segment_header *) (self_file_data +
-                sizeof(struct sce_self_header) + (i * sizeof(struct sce_self_segment_header)));
+        segment = (struct sce_self_segment_header *)(self_file_data + sizeof(struct sce_self_header) + (i * sizeof(struct sce_self_segment_header)));
 
         if (SELF_SEGMENT_HAS_DIGESTS(segment)) {
-            target_segment = (struct sce_self_segment_header *) (self_file_data +
-                sizeof(struct sce_self_header) + (SELF_SEGMENT_ID(segment) * sizeof(struct sce_self_segment_header)));
-            SOCK_LOG(sock, "  [?] decrypting block info segment for %lu\n", SELF_SEGMENT_ID(target_segment));
-            block_segments[SELF_SEGMENT_ID(segment)] = self_decrypt_segment(
-                sock,
-                authmgr_handle,
-                service_id,
-                self_file_data,
-                segment,
-                SELF_SEGMENT_ID(target_segment),
-                offsets
-            );
-
+            target_segment = (struct sce_self_segment_header *)(self_file_data + sizeof(struct sce_self_header) + (SELF_SEGMENT_ID(segment) * sizeof(struct sce_self_segment_header)));
+            block_segments[SELF_SEGMENT_ID(segment)] = self_decrypt_segment(sock, authmgr_handle, service_id, self_file_data, segment, SELF_SEGMENT_ID(target_segment), offsets);
             if (block_segments[SELF_SEGMENT_ID(segment)] == NULL) {
-                SOCK_LOG(sock, "[!] failed to decrypt segment info for segment %lu\n", SELF_SEGMENT_ID(segment));
-                err = -11;
-                goto cleanup_out_file_data;
+                SOCK_LOG(sock, "[!] failed to decrypt segment info for %lu\n", SELF_SEGMENT_ID(segment));
+                err = -8;
+                goto cleanup;
             }
         }
     }
 
-    /*for (int i = 0; i < header->segment_count; i++) {
-        if (block_segments[i]) {
-            SOCK_LOG(sock, "decrypted info segment for seg=0x%02x (%d blocks)\n", i, block_segments[i]->block_count);
-
-            for (int j = 0; j < block_segments[i]->block_count; j++) {
-                SOCK_LOG(sock, "  block #%04d, extent (offset: 0x%08x, len: 0x%08x), digest:\n",
-                         j,
-                         block_segments[i]->extents[j]->offset,
-                         block_segments[i]->extents[j]->len);
-                DumpHex(sock, (block_segments[i]->data + (j * 0x20)), 0x20);
-            }
-        }
-    }*/
-
-    // Decrypt regular blocked-segments to file
     for (int i = 0; i < header->segment_count; i++) {
-        segment = (struct sce_self_segment_header *) (self_file_data +
-                sizeof(struct sce_self_header) + (i * sizeof(struct sce_self_segment_header)));
+        segment = (struct sce_self_segment_header *)(self_file_data + sizeof(struct sce_self_header) + (i * sizeof(struct sce_self_segment_header)));
 
-        // Ignore info and non-blocked segments
-        if (!SELF_SEGMENT_HAS_BLOCKS(segment) || SELF_SEGMENT_HAS_DIGESTS(segment)) {
+        if (!SELF_SEGMENT_HAS_BLOCKS(segment) || SELF_SEGMENT_HAS_DIGESTS(segment))
             continue;
-        }
 
-        // Get accompanying ELF segment
         cur_phdr = start_phdrs;
-        for (int phnum = 0; phnum < header->segment_count; phnum++) {
+        for (int j = 0; j < header->segment_count; j++) {
             if (cur_phdr->p_filesz == segment->uncompressed_size)
                 break;
             cur_phdr++;
         }
 
-        // Get block info for this segment
         block_info = block_segments[i];
-        if (block_info == NULL) {
-            SOCK_LOG(sock, "[!] we don't have block info for segment %d\n", i);
+        if (!block_info)
             continue;
-        }
 
-        // Allocate array to hold decrypted block data
         block_data = bump_calloc(block_info->block_count, sizeof(void *));
         if (block_data == NULL) {
-            err = -12;
-            goto cleanup_out_file_data;
+            err = -9;
+            goto cleanup;
         }
 
-        // Get tail block size
+        int failed_blocks = 0;
+
         tail_block_size = segment->uncompressed_size % SELF_SEGMENT_BLOCK_SIZE(segment);
 
         for (int block = 0; block < block_info->block_count; block++) {
-            SOCK_LOG(sock, "  [?] %s: decrypting segment=%d, block=%d/%lu\n", path, i, block + 1, block_info->block_count);
-            block_data[block] = self_decrypt_block(
-                sock,
-                authmgr_handle,
-                service_id,
-                self_file_data,
-                segment,
-                i,
-                block_info,
-                block,
-                offsets
-            );
-
-            // if (block_data[block] == NULL) {
-            //     SOCK_LOG(sock, "[!] failed to decrypt block %d\n", block);
-            //     err = -11;
-            //     goto cleanup_out_file_data;
-            // }
-            if (block_data[block] == NULL) {
-                SOCK_LOG(sock, "[!] failed to decrypt block %d, filling with 0x00\n", block);
-                void *out_addr = out_file_data + cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment));
-                if (block == block_info->block_count - 1) {
-                    memset(out_addr, 0x00, tail_block_size);
-                } else {
-                    memset(out_addr, 0x00, SELF_SEGMENT_BLOCK_SIZE(segment));
-                }
-                continue;
-            }
-
-            // Copy block to output buffer
+            block_data[block] = self_decrypt_block(sock, authmgr_handle, service_id, self_file_data, segment, i, block_info, block, offsets);
             void *out_addr = out_file_data + cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment));
 
-            if (block == block_info->block_count - 1) {
-                // Last block, truncate size
-                memcpy(out_addr, block_data[block], tail_block_size);
+            if (block_data[block] == NULL) {
+                failed_blocks++;
+                if (failed_blocks >= MAX_FAILED_BLOCKS) {
+                    SOCK_LOG(sock, "[!] too many failed blocks, aborting!\n");
+                    err = -10;
+                    goto cleanup;
+                }
+                memset(out_addr, 0x00, block == block_info->block_count - 1 ? tail_block_size : SELF_SEGMENT_BLOCK_SIZE(segment));
             } else {
-                memcpy(out_addr, block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
+                failed_blocks = 0;
+                memcpy(out_addr, block_data[block], block == block_info->block_count - 1 ? tail_block_size : SELF_SEGMENT_BLOCK_SIZE(segment));
+                munmap(block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
             }
-
-            munmap(block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
         }
     }
 
-    SOCK_LOG(sock, "[?] writing decrypted SELF to file...\n");
-
-    if (final_file_size == 0) {
-        SOCK_LOG(sock, "[!] final file size is 0, skipping write\n");
-        err = -5;
-    } else {
-        written_bytes = write(out_fd, out_file_data, final_file_size);
-        if (written_bytes != final_file_size) {
-            SOCK_LOG(sock, "[!] failed to dump to file, %d != %lu (%d).\n", written_bytes, final_file_size, errno);
-            err = -5;
-        } else {
-            SOCK_LOG(sock, "  [+] wrote 0x%08x bytes...\n", written_bytes);
-        }
+    written_bytes = write(out_fd, out_file_data, final_file_size);
+    if (written_bytes != final_file_size) {
+        SOCK_LOG(sock, "[!] failed to write output\n");
+        err = -11;
     }
-    
 
+cleanup:
+    if (self_file_data && self_file_data != MAP_FAILED)
+        munmap(self_file_data, self_file_stat.st_size);
+    if (out_file_data && out_file_data != MAP_FAILED)
+        munmap(out_file_data, final_file_size);
+    if (self_file_fd >= 0)
+        close(self_file_fd);
+    if (out_fd >= 0)
+        close(out_fd);;
 
-cleanup_out_file_data:
-    munmap(out_file_data, final_file_size);
-cleanup_in_file_data:
-    munmap(self_file_data, self_file_stat.st_size);
-    close(self_file_fd);
-    close(out_fd);
-
-    // Reset the bump allocator
     bump_reset();
 
     return err;
@@ -811,7 +718,7 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
         SOCK_LOG(sock, "[+] processing %s\n", entry);
         int entry_len = strlen(entry);
 
-        sprintf((char *) &out_file_path, "%s%s", out_dir_path, entry);
+        sprintf(out_file_path, "%s%s", out_dir_path, entry);
 
         // Check if output file already exists and is non-zero size, if so skip it
         out_fd = open(out_file_path, O_RDONLY, 0);
@@ -831,10 +738,13 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
 //        }
 
         char parent_dir[PATH_MAX];
-        int last_slash = strrchr(out_file_path, '/') - out_file_path;
-        strncpy(parent_dir, out_file_path, last_slash);
-        parent_dir[last_slash] = '\0';
-        _mkdir(parent_dir);
+        char *last_slash_ptr = strrchr(out_file_path, '/');
+        if (last_slash_ptr != NULL) {
+            int last_slash = last_slash_ptr - out_file_path;
+            strncpy(parent_dir, out_file_path, last_slash);
+            parent_dir[last_slash] = '\0';
+            _mkdir(parent_dir);
+        }        
 
         // Decrypt
         out_fd = open(out_file_path, O_WRONLY | O_CREAT, 0644);
@@ -1085,8 +995,17 @@ int main()
     dump(sock, authmgr_handle, &offsets, "/data/dump");
 //emma
 out:
+    if (g_dump_queue_buf != NULL && g_dump_queue_buf != MAP_FAILED) {
+        munmap(g_dump_queue_buf, G_DUMP_QUEUE_BUF_SIZE);
+        g_dump_queue_buf = NULL;
+    }
+    if (g_bump_allocator_base != NULL && g_bump_allocator_base != MAP_FAILED) {
+        munmap(g_bump_allocator_base, g_bump_allocator_len);
+        g_bump_allocator_base = NULL;
+    }
 #ifdef LOG_TO_SOCKET
 	close(sock);
 #endif
 	return 0;
+
 }
