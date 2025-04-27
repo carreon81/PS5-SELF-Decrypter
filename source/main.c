@@ -317,7 +317,7 @@ void *self_decrypt_block(
     }
 
     // Request segment decryption
-    for (int tries = 0; tries < 5; tries++) {
+    for (int tries = 0; tries < 50; tries++) {
         err = _sceSblAuthMgrSmLoadSelfBlock(
             sock,
             authmgr_handle,
@@ -332,7 +332,7 @@ void *self_decrypt_block(
         if (err == 0)
             break;
 
-        usleep(100000);
+        usleep(200000);
     }
 
     if (err != 0)
