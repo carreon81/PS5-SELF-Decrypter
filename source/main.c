@@ -319,7 +319,7 @@ void *self_decrypt_block(
     }
 
     // Request segment decryption
-    for (int tries = 0; tries < 20; tries++) {
+    for (int tries = 0; tries < 50; tries++) {
         err = _sceSblAuthMgrSmLoadSelfBlock(
             sock,
             authmgr_handle,
@@ -334,7 +334,7 @@ void *self_decrypt_block(
         if (err == 0)
             break;
 
-        usleep(50000);
+        usleep(200000);
     }
 
     if (err != 0)
@@ -604,13 +604,20 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
 
     SOCK_LOG(sock, "[?] writing decrypted SELF to file...\n");
 
-    written_bytes = write(out_fd, out_file_data, final_file_size);
-    if (written_bytes != final_file_size) {
-        SOCK_LOG(sock, "[!] failed to dump to file, %d != %lu (%d).\n", written_bytes, final_file_size, errno);
+    if (final_file_size == 0) {
+        SOCK_LOG(sock, "[!] final file size is 0, skipping write\n");
         err = -5;
+    } else {
+        written_bytes = write(out_fd, out_file_data, final_file_size);
+        if (written_bytes != final_file_size) {
+            SOCK_LOG(sock, "[!] failed to dump to file, %d != %lu (%d).\n", written_bytes, final_file_size, errno);
+            err = -5;
+        } else {
+            SOCK_LOG(sock, "  [+] wrote 0x%08x bytes...\n", written_bytes);
+        }
     }
+    
 
-    SOCK_LOG(sock, "  [+] wrote 0x%08x bytes...\n", written_bytes);
 
 cleanup_out_file_data:
     munmap(out_file_data, final_file_size);
@@ -848,8 +855,18 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
         }
 
         if (err != 0) {
-            unlink(out_file_path);
-            SOCK_LOG(sock, "[!] failed to dump %s\n", entry);
+            struct stat statbuf;
+            if (stat(out_file_path, &statbuf) == 0) {
+                if (statbuf.st_size == 0) {
+                    // Si el archivo existe pero pesa 0 bytes, borrarlo
+                    unlink(out_file_path);
+                    SOCK_LOG(sock, "[!] removed empty file %s\n", out_file_path);
+                } else {
+                    SOCK_LOG(sock, "[!] kept partially dumped file %s\n", out_file_path);
+                }
+            } else {
+                SOCK_LOG(sock, "[!] could not stat %s\n", out_file_path);
+            }
         }
 
         if (err == -5) {
