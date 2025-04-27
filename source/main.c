@@ -712,9 +712,9 @@ int dump_queue_add_file(int sock, char *path)
     
     return 0;
 }
-
+/*
 #define DENTS_BUF_SIZE 0x10000
-int dump_queue_add_dir(int sock, char* path, int recursive)
+    int dump_queue_add_dir(int sock, char* path, int recursive)
 {
     int dir_fd = open(path, O_RDONLY, 0);
     if (dir_fd < 0) {
@@ -761,7 +761,7 @@ int dump_queue_add_dir(int sock, char* path, int recursive)
     close(dir_fd);
     free(dents);
     return 0;    
-}
+}*/
 
 
 int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, const char *out_dir_path)
@@ -1052,7 +1052,7 @@ int main()
     // i did this so when i pass in `/mnt/sandbox/pfsmnt` it will only dump `/mnt/sandbox/pfsmnt/PPSA01487-app0-patch0-union`
     // bc for ps5 games, `app0` and `app0-patch0-union` has the same files
 
-    dump_queue_add_dir(sock, "/mnt/sandbox/pfsmnt", 1);
+    dump_queue_add_file(sock, "/mnt/sandbox/CUSA13586_000/app0/eboot.bin");
     dump(sock, authmgr_handle, &offsets, "/data/dump");
 
 out:
