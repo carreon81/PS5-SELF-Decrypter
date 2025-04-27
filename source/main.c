@@ -1054,7 +1054,7 @@ int main()
 
     dump_queue_add_file(sock, "/mnt/sandbox/CUSA13586_000/app0/eboot.bin");
     dump(sock, authmgr_handle, &offsets, "/data/dump");
-
+//emma
 out:
 #ifdef LOG_TO_SOCKET
 	close(sock);
