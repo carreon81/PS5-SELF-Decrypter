@@ -13,6 +13,8 @@
 #include <limits.h>
 #include <math.h>
 
+#define LOG_TO_SOCKET
+
 #include <ps5/kernel.h>
 
 #include "sbl.h"
