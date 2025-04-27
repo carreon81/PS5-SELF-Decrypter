@@ -12,8 +12,18 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+// <-- pega aquí la definición de SOCK_LOG
+#ifdef LOG_TO_SOCKET
+#define SOCK_LOG(sock, fmt, ...)                                      \
+  do {                                                                \
+    char ___buf[512];                                                 \
+    int ___len = snprintf(___buf, sizeof(___buf), fmt, ##__VA_ARGS__); \
+    if (___len > 0) sock_print(sock, ___buf);                         \
+  } while (0)
+#else
+#define SOCK_LOG(sock, fmt, ...)  printf(fmt, ##__VA_ARGS__)
+#endif
 
-#define LOG_TO_SOCKET
 
 #include <ps5/kernel.h>
 
@@ -213,9 +223,12 @@ struct self_block_segment *self_decrypt_segment(
     if (err != 0)
         return NULL;
 
-    out_segment_data = mmap(NULL, segment->uncompressed_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (out_segment_data == NULL)
+    out_segment_data = malloc(segment->uncompressed_size);
+    if (out_segment_data == NULL) {
+        SOCK_LOG(sock, "[!] failed to allocate memory for segment data\n");
         return NULL;
+    }
+        
 
     // Copy out decrypted content
     kernel_copyout(data_blob_va, out_segment_data, segment->uncompressed_size);
@@ -306,21 +319,22 @@ void *self_decrypt_block(
     uint64_t input_addr;
     void *out_block_data;
 
+    // Asignamos la dirección de salida sin necesidad de mmap
     data_out_va  = g_kernel_data_base + offsets->offset_datacave_1;
     data_out_pa  = pmap_kextract(sock, data_out_va);
 
     data_blob_va = g_kernel_data_base + offsets->offset_datacave_2;
     data_blob_pa = pmap_kextract(sock, data_blob_va);
 
-    // Calculate input address and size
+    // Calculamos la dirección de entrada para el bloque y su tamaño
     input_addr = (uint64_t) (file_data + segment->offset + block_segment->extents[block_idx]->offset);
 
-    // Segmented copy into data cave #1
+    // Copiar los datos segmentados en la datacave #1
     for (int i = 0; i < 4; i++) {
         kernel_copyin((void *) (input_addr + (i * 0x1000)), data_blob_va + (i * 0x1000), 0x1000);
     }
 
-    // Request segment decryption
+    // Solicitar la desencriptación del bloque
     for (int tries = 0; tries < 50; tries++) {
         err = _sceSblAuthMgrSmLoadSelfBlock(
             sock,
@@ -336,26 +350,23 @@ void *self_decrypt_block(
         if (err == 0)
             break;
 
-        usleep(200000);
+        usleep(500000);
     }
 
-    if (err != 0)
-    {
+    if (err != 0) {
         SOCK_LOG(sock, "[!] failed to decrypt block %d, err: %d\n", block_idx, err);
         return NULL;
     }
 
-    out_block_data = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (out_block_data == NULL)
-        return NULL;
+    // Directamente copio la desencriptación al buffer de salida
+    out_block_data = (void *) (data_out_va + block_idx * 0x4000);
 
-    // Segmented copy out decrypted content
-    for (int i = 0; i < 4; i++) {
-        kernel_copyout(data_out_va + (i * 0x1000), out_block_data + (i * 0x1000), 0x1000);
-    }
+    // Copiar el bloque desencriptado a la salida
+    kernel_copyout(data_out_va + (block_idx * 0x4000), out_block_data, 0x4000);
 
     return out_block_data;
 }
+
 
 int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, struct tailored_offsets *offsets)
 {
@@ -388,9 +399,9 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
     fstat(self_file_fd, &self_file_stat);
 
     // Alocamos buffer manualmente y leemos
-    self_file_data = mmap(NULL, self_file_stat.st_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (self_file_data == MAP_FAILED || self_file_data == NULL) {
-        SOCK_LOG(sock, "[!] mmap failed\n");
+    self_file_data = malloc(self_file_stat.st_size);
+    if (self_file_data == NULL) {
+        SOCK_LOG(sock, "[!] malloc failed for SELF buffer\n");
         err = -2;
         goto cleanup;
     }
@@ -441,12 +452,13 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
         goto cleanup;
     }
 
-    out_file_data = mmap(NULL, final_file_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (out_file_data == MAP_FAILED || out_file_data == NULL) {
-        SOCK_LOG(sock, "[!] failed to alloc output buffer\n");
+    out_file_data = malloc(final_file_size);
+    if (out_file_data == NULL) {
+        SOCK_LOG(sock, "[!] malloc failed for output buffer\n");
         err = -6;
         goto cleanup;
     }
+    
 
     memcpy(out_file_data, elf_header, sizeof(struct elf64_hdr));
     memcpy(out_file_data + sizeof(struct elf64_hdr), start_phdrs, elf_header->e_phnum * sizeof(struct elf64_phdr));
@@ -513,7 +525,7 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
             } else {
                 failed_blocks = 0;
                 memcpy(out_addr, block_data[block], block == block_info->block_count - 1 ? tail_block_size : SELF_SEGMENT_BLOCK_SIZE(segment));
-                munmap(block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
+                free(block_data[block]);
             }
         }
     }
@@ -525,10 +537,14 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
     }
 
 cleanup:
-    if (self_file_data && self_file_data != MAP_FAILED)
-        munmap(self_file_data, self_file_stat.st_size);
-    if (out_file_data && out_file_data != MAP_FAILED)
-        munmap(out_file_data, final_file_size);
+    if (self_file_data) {
+        free(self_file_data);
+        self_file_data = NULL;
+    }
+    if (out_file_data) {
+        free(out_file_data);
+        out_file_data = NULL;
+    }
     if (self_file_fd >= 0)
         close(self_file_fd);
     if (out_fd >= 0)
@@ -541,16 +557,19 @@ cleanup:
 
 int dump_queue_init(int sock)
 {
-    if (g_dump_queue_buf != NULL && g_dump_queue_buf != MAP_FAILED) {
+    if (g_dump_queue_buf != NULL) {
         return 0;
     }
 
-    g_dump_queue_buf = mmap(NULL, G_DUMP_QUEUE_BUF_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (g_dump_queue_buf == NULL || g_dump_queue_buf == MAP_FAILED) {
+    g_dump_queue_buf = malloc(G_DUMP_QUEUE_BUF_SIZE);
+    if (g_dump_queue_buf == NULL) {
         SOCK_LOG(sock, "[!] failed to allocate buffer for directory entries\n");
         exit(-1);
     }
 
+    // Inicializamos posición y contenido
+    g_dump_queue_buf_pos = 0;
+    memset(g_dump_queue_buf, 0, G_DUMP_QUEUE_BUF_SIZE);
     return 0;
 }
 
@@ -732,11 +751,6 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
             }
         }
 
-//        for (int i = 0; i < 0x100; i++) {
-//            kernel_copyin(&spinlock_lock, g_kernel_data_base + offsets->offset_sbl_sxlock + 0x18, 0x8);
-//            usleep(100);
-//        }
-
         char parent_dir[PATH_MAX];
         char *last_slash_ptr = strrchr(out_file_path, '/');
         if (last_slash_ptr != NULL) {
@@ -822,7 +836,7 @@ int main()
 
     // Initialize bump allocator
     g_bump_allocator_len  = 0x100000;
-    g_bump_allocator_base = mmap(NULL, g_bump_allocator_len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    g_bump_allocator_base = malloc(g_bump_allocator_len);
     if (g_bump_allocator_base == NULL) {
         SOCK_LOG(sock, "[!] failed to allocate backing space for bump allocator\n");
         goto out;
@@ -953,8 +967,11 @@ int main()
             break;
         default:
             SOCK_LOG(sock, "[!] unsupported firmware, dumping then bailing!\n");
-            char *dump_buf = mmap(NULL, 0x7800 * 0x1000, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-
+            char *dump_buf = malloc(0x7800 * 0x1000);
+            if (dump_buf == NULL) {
+                SOCK_LOG(sock, "[!] failed to allocate memory for dump buffer\n");
+                goto out;
+            }
             for (int pg = 0; pg < 0x7800; pg++) {
                 kernel_copyout(g_kernel_data_base + (pg * 0x1000), dump_buf + (pg * 0x1000), 0x1000);
             }
@@ -995,12 +1012,13 @@ int main()
     dump(sock, authmgr_handle, &offsets, "/data/dump");
 //emma
 out:
-    if (g_dump_queue_buf != NULL && g_dump_queue_buf != MAP_FAILED) {
-        munmap(g_dump_queue_buf, G_DUMP_QUEUE_BUF_SIZE);
+    if (g_dump_queue_buf != NULL) {
+        free(g_dump_queue_buf);  // Cambiado de munmap a free
         g_dump_queue_buf = NULL;
     }
-    if (g_bump_allocator_base != NULL && g_bump_allocator_base != MAP_FAILED) {
-        munmap(g_bump_allocator_base, g_bump_allocator_len);
+
+    if (g_bump_allocator_base != NULL) {
+        free(g_bump_allocator_base);  // Cambiado de munmap a free
         g_bump_allocator_base = NULL;
     }
 #ifdef LOG_TO_SOCKET
