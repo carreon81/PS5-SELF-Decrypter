@@ -686,12 +686,12 @@ int dump_queue_add_file(int sock, char *path)
     read(fd, &magic, sizeof(magic));
     close(fd);
     
-    if (magic != SELF_PROSPERO_MAGIC) {
-// #if DEBUG
-        SOCK_LOG(sock, "[!] not a PS5 SELF file: %s\n", path);
-// #endif
-        return -5;
-    }
+    // if (magic != SELF_PROSPERO_MAGIC) {
+
+    //     SOCK_LOG(sock, "[!] not a PS5 SELF file: %s\n", path);
+
+    //     return -5;
+    // }
 
     int new_g_dump_queue_buf_pos = g_dump_queue_buf_pos + len + 1;
     if (new_g_dump_queue_buf_pos >= G_DUMP_QUEUE_BUF_SIZE) {
