@@ -828,7 +828,7 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
         err = decrypt_self(sock, authmgr_handle, entry, out_fd, offsets);
         if (err == -11) {
             // Give 2 more attempts
-            for (int attempt = 0; attempt < 2; attempt++) {
+            for (int attempt = 0; attempt < 5; attempt++) {
                 out_fd = open(out_file_path, O_WRONLY | O_CREAT, 0644);
                 err = decrypt_self(sock, authmgr_handle, entry, out_fd, offsets);
                 if (err == 0)
@@ -837,8 +837,8 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
         }
 
         if (err != 0) {
-            unlink(out_file_path);
-            SOCK_LOG(sock, "[!] failed to dump %s\n", entry);
+            // unlink(out_file_path);
+            SOCK_LOG(sock, "[!] keeping partial file: %s\n", entry);
         }
 
         if (err == -5) {
