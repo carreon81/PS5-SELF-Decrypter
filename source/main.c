@@ -406,11 +406,11 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
         SOCK_LOG(sock, "[+] read file into memory\n");
     }
 
-    if (*(uint32_t *) (self_file_data) != SELF_PROSPERO_MAGIC) {
-        SOCK_LOG(sock, "[!] %s is not a PS5 SELF file\n", path);
-        err = -22;
-        goto cleanup_in_file_data;
-    }
+    // if (*(uint32_t *) (self_file_data) != SELF_PROSPERO_MAGIC) {
+    //     SOCK_LOG(sock, "[!] %s is not a PS5 SELF file\n", path);
+    //     err = -22;
+    //     goto cleanup_in_file_data;
+    // }
 
     SOCK_LOG(sock, "[+] decrypting %s...\n", path);
 
