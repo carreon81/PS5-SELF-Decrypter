@@ -1052,7 +1052,7 @@ int main()
     // i did this so when i pass in `/mnt/sandbox/pfsmnt` it will only dump `/mnt/sandbox/pfsmnt/PPSA01487-app0-patch0-union`
     // bc for ps5 games, `app0` and `app0-patch0-union` has the same files
 
-    dump_queue_add_file(sock, "/mnt/sandbox/CUSA13586_000/app0/eboot.bin");
+    dump_queue_add_file(sock, "/mnt/sandbox/pfsmnt/CUSA13586-app0-patch0-union/eboot.bin");
     dump(sock, authmgr_handle, &offsets, "/data/dump");
 //emma
 out:
