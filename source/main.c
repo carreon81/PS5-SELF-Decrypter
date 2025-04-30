@@ -828,10 +828,6 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
     uintptr_t sbl_sxlock_addr = g_kernel_data_base + offsets->offset_sbl_sxlock + 0x18;
     kernel_copyout(sbl_sxlock_addr, &spinlock_unlock, sizeof(spinlock_unlock));
 
-  
-    SOCK_LOG(sock, "  [!] block 0x%x -> first bytes: %02x %02x %02x %02x\n", block_idx, dbg[0], dbg[1], dbg[2], dbg[3]);
-
-
     // Lock the SBL spinlock BKL style
     for (int i = 0; i < 0x100; i++) {
         kernel_copyin(&spinlock_lock, sbl_sxlock_addr, sizeof(spinlock_lock));
