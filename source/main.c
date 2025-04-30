@@ -1084,6 +1084,7 @@ int main()
     //ps5   
     //dump_queue_add_dir(sock, "/mnt/sandbox/pfsmnt", 1);
     dump_eboot_from_disc(sock);
+    dump(sock, authmgr_handle, &offsets, "/data/dump");
 
     //dump(sock, authmgr_handle, &offsets, "/data/dump");
 
