@@ -315,7 +315,7 @@ void *self_decrypt_block(
     for (int i = 0; i < 4; i++) {
         kernel_copyin((void *) (input_addr + (i * 0x1000)), data_blob_va + (i * 0x1000), 0x1000);
     }
-
+    
     // Request segment decryption
     for (int tries = 0; tries < 50; tries++) {
         err = _sceSblAuthMgrSmLoadSelfBlock(
@@ -345,10 +345,20 @@ void *self_decrypt_block(
     if (out_block_data == NULL)
         return NULL;
 
+    uint8_t *dbg = (uint8_t *)out_block_data;    
     // Segmented copy out decrypted content
     for (int i = 0; i < 4; i++) {
         kernel_copyout(data_out_va + (i * 0x1000), out_block_data + (i * 0x1000), 0x1000);
     }
+
+   
+    SOCK_LOG(sock, "  [!] Dump preview (block %d): %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+        block_idx,
+        dbg[0], dbg[1], dbg[2], dbg[3],
+        dbg[4], dbg[5], dbg[6], dbg[7],
+        dbg[8], dbg[9], dbg[10], dbg[11],
+        dbg[12], dbg[13], dbg[14], dbg[15]);
+
 
     return out_block_data;
 }
@@ -520,20 +530,25 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
             continue;
         }
 
-        // Get accompanying ELF segment
-        cur_phdr = start_phdrs;
-        int phnum;
-        for (int phnum = 0; phnum < header->segment_count; phnum++) {
-            if (cur_phdr->p_filesz == segment->uncompressed_size)
+        cur_phdr = NULL;
+        for (int p = 0; p < elf_header->e_phnum; p++) {
+            struct elf64_phdr *ph = &start_phdrs[p];
+            if (ph->p_type == PT_LOAD && ph->p_memsz == segment->uncompressed_size) {
+                cur_phdr = ph;
                 break;
-            cur_phdr++;
+            }
+        }
+
+        if (cur_phdr == NULL) {
+            SOCK_LOG(sock, "[!] No PT_LOAD segment matching uncompressed size for segment %d\n", i);
+            continue;
         }
 
         // Verificamos si se encontró algún segmento ELF
-        if (phnum == header->segment_count) {
-            SOCK_LOG(sock, "[!] ELF segment not found for segment %d\n", i);
-            continue;
-        }
+        // if (phnum == header->segment_count) {
+        //     SOCK_LOG(sock, "[!] ELF segment not found for segment %d\n", i);
+        //     continue;
+        // }
 
         // Get block info for this segment
         block_info = block_segments[i];
@@ -554,6 +569,7 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
 
         for (int block = 0; block < block_info->block_count; block++) {
             SOCK_LOG(sock, "  [?] %s: decrypting segment=%d, block=%d/%lu\n", path, i, block + 1, block_info->block_count);
+        
             block_data[block] = self_decrypt_block(
                 sock,
                 authmgr_handle,
@@ -565,33 +581,40 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
                 block,
                 offsets
             );
-
+        
             if (block_data[block] == NULL) {
                 SOCK_LOG(sock, "[!] failed to decrypt block %d\n", block);
                 err = -11;
                 goto cleanup_out_file_data;
             }
 
-            // Copy block to output buffer
+            // DEBUG: Mostrar los primeros 16 bytes del bloque
+            uint8_t *block_bytes = (uint8_t *)block_data[block];
+            SOCK_LOG(sock, "      First 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                block_bytes[0], block_bytes[1], block_bytes[2], block_bytes[3],
+                block_bytes[4], block_bytes[5], block_bytes[6], block_bytes[7],
+                block_bytes[8], block_bytes[9], block_bytes[10], block_bytes[11],
+                block_bytes[12], block_bytes[13], block_bytes[14], block_bytes[15]);
+        
+            // Calcular tamaño del bloque actual
+            size_t size = (block == block_info->block_count - 1 && tail_block_size > 0)
+                ? tail_block_size
+                : SELF_SEGMENT_BLOCK_SIZE(segment);
+        
+            // Calcular destino y copiar
             void *out_addr = out_file_data + cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment));
-
-            size_t size;
-
-            if (block == block_info->block_count - 1) {
-                size = tail_block_size;
-                if (size > 0) {
-                    SOCK_LOG(sock, "  [>] writing block %d to offset 0x%lx (size: 0x%lx)\n", block, cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment)), size);
-                    memcpy(out_addr, block_data[block], size);
-                }
-            } else {
-                size = SELF_SEGMENT_BLOCK_SIZE(segment);
-                SOCK_LOG(sock, "  [>] writing block %d to offset 0x%lx (size: 0x%lx)\n", block, cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment)), size);
-                memcpy(out_addr, block_data[block], size);
-            }
-
+        
+            // Loguear antes de escribir
+            SOCK_LOG(sock, "  [>] writing block %d to offset 0x%lx (size: 0x%lx)\n",
+                block,
+                cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment)),
+                size);
+        
+            memcpy(out_addr, block_data[block], size);
+        
             munmap(block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
         }
-
+        
     }
 
     // Validación: chequeo que todos los segmentos PT_LOAD fueron correctamente desencriptados
@@ -804,6 +827,10 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
 
     uintptr_t sbl_sxlock_addr = g_kernel_data_base + offsets->offset_sbl_sxlock + 0x18;
     kernel_copyout(sbl_sxlock_addr, &spinlock_unlock, sizeof(spinlock_unlock));
+
+  
+    SOCK_LOG(sock, "  [!] block 0x%x -> first bytes: %02x %02x %02x %02x\n", block_idx, dbg[0], dbg[1], dbg[2], dbg[3]);
+
 
     // Lock the SBL spinlock BKL style
     for (int i = 0; i < 0x100; i++) {
