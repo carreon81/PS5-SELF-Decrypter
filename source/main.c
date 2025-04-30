@@ -434,7 +434,7 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
 
     for (int i = 0; i < elf_header->e_phnum; i++) {
         if (cur_phdr->p_type == PT_LOAD) {
-            uint64_t end_offset = cur_phdr->p_offset + cur_phdr->p_filesz;
+            uint64_t end_offset = cur_phdr->p_offset + cur_phdr->p_memsz;;
             if (end_offset > final_file_size) {
                 final_file_size = end_offset;
             }
@@ -482,6 +482,12 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
                 SOCK_LOG(sock, "[!] segment ID %u out of range\n", seg_id);
                 continue;
             }
+
+            if (block_segments[seg_id] != NULL) {
+                SOCK_LOG(sock, "[!] segment ID %u already processed, skipping duplicate\n", seg_id);
+                continue;
+            }
+            
             target_segment = (struct sce_self_segment_header *) (self_file_data +
                 sizeof(struct sce_self_header) + (SELF_SEGMENT_ID(segment) * sizeof(struct sce_self_segment_header)));
             SOCK_LOG(sock, "  [?] decrypting block info segment for %lu\n", SELF_SEGMENT_ID(target_segment));
@@ -569,16 +575,44 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
             // Copy block to output buffer
             void *out_addr = out_file_data + cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment));
 
+            size_t size;
+
             if (block == block_info->block_count - 1) {
-                // Last block, truncate size
-                memcpy(out_addr, block_data[block], tail_block_size);
+                size = tail_block_size;
+                if (size > 0) {
+                    SOCK_LOG(sock, "  [>] writing block %d to offset 0x%lx (size: 0x%lx)\n", block, cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment)), size);
+                    memcpy(out_addr, block_data[block], size);
+                }
             } else {
-                memcpy(out_addr, block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
+                size = SELF_SEGMENT_BLOCK_SIZE(segment);
+                SOCK_LOG(sock, "  [>] writing block %d to offset 0x%lx (size: 0x%lx)\n", block, cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment)), size);
+                memcpy(out_addr, block_data[block], size);
             }
 
             munmap(block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
         }
 
+    }
+
+    // Validación: chequeo que todos los segmentos PT_LOAD fueron correctamente desencriptados
+    for (int i = 0; i < elf_header->e_phnum; i++) {
+        struct elf64_phdr *ph = &start_phdrs[i];
+        if (ph->p_type == PT_LOAD) {
+            void *segment_start = out_file_data + ph->p_offset;
+
+            // Verificamos si hay datos no escritos (todo cero) en este segmento
+            int is_zero = 1;
+            for (uint64_t j = 0; j < ph->p_filesz; j++) {
+                if (((uint8_t *)segment_start)[j] != 0) {
+                    is_zero = 0;
+                    break;
+                }
+            }
+
+            if (is_zero) {
+                SOCK_LOG(sock, "[!] Warning: Segment %d at offset 0x%lx appears to be all zero (possibly missing decryption?)\n", i, ph->p_offset);
+            }
+        }
     }
 
     SOCK_LOG(sock, "[?] writing decrypted SELF to file...\n");
@@ -589,6 +623,12 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
     }
 
     SOCK_LOG(sock, "  [+] wrote 0x%08x bytes...\n", written_bytes);
+
+    if (written_bytes != final_file_size) {
+        SOCK_LOG(sock, "[!] Final file size mismatch! Expected: 0x%lx, Written: 0x%x\n", final_file_size, written_bytes);
+        err = -6;
+    }
+    
 
 cleanup_out_file_data:
     munmap(out_file_data, final_file_size);
