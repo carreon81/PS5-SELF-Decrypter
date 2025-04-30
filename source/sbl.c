@@ -220,8 +220,11 @@ int sceSblServiceRequest(int sock, struct sbl_msg_header *msg_header, void *in_b
 
     usleep(2000);
 
+
     if (res_after == res_before) {
-        SOCK_LOG(sock, "sceSblServiceRequest: request timed out\n");
+        SOCK_LOG(sock, "⚠️ Timeout: still no response after 500ms\n");
+        DumpHex(sock, msg_header, sizeof(struct sbl_msg_header));
+        DumpHex(sock, in_buf, msg_header->query_len);
         return -1;
     }
 

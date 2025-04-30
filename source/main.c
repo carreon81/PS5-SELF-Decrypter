@@ -282,7 +282,7 @@ struct self_block_segment *self_decrypt_segment(
     segment_info->extents = block_infos;
     return segment_info;
 }
-
+// ELF block max size: 0x4000 is the max segment chunk size handled (4 * 0x1000)
 void *self_decrypt_block(
     int sock,
     int authmgr_handle,
@@ -406,12 +406,6 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
         SOCK_LOG(sock, "[+] read file into memory\n");
     }
 
-    // if (*(uint32_t *) (self_file_data) != SELF_PROSPERO_MAGIC) {
-    //     SOCK_LOG(sock, "[!] %s is not a PS5 SELF file\n", path);
-    //     err = -22;
-    //     goto cleanup_in_file_data;
-    // }
-
     SOCK_LOG(sock, "[+] decrypting %s...\n", path);
 
     // Verify SELF header and get a context handle
@@ -434,27 +428,23 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
                     (sizeof(struct sce_self_segment_header) * header->segment_count));
     start_phdrs = (struct elf64_phdr *) ((char *) (elf_header) + sizeof(struct elf64_hdr));
 
-    // Allocate backing buffer for output file data. We'll get size by finding the NOTE program header which should be
-    // in most SELFs
+    // Calculate final file size from all PT_LOAD segments (works best for PS4 SELF)
     cur_phdr = start_phdrs;
     final_file_size = 0;
+
     for (int i = 0; i < elf_header->e_phnum; i++) {
-        if (cur_phdr->p_type == PT_NOTE)
-            final_file_size = cur_phdr->p_offset + cur_phdr->p_filesz;
+        if (cur_phdr->p_type == PT_LOAD) {
+            uint64_t end_offset = cur_phdr->p_offset + cur_phdr->p_filesz;
+            if (end_offset > final_file_size) {
+                final_file_size = end_offset;
+            }
+        }
         cur_phdr++;
     }
 
-    if (final_file_size == 0) {
-        // Second chance: fallback on latest LOAD segment size
-        SOCK_LOG(sock, "  [?] file segments are irregular, falling back on last LOAD segment\n");
+    SOCK_LOG(sock, "  [+] Calculated final file size: 0x%lx\n", final_file_size);
 
-        cur_phdr = start_phdrs;
-        for (int i = 0; i < elf_header->e_phnum; i++) {
-            if (cur_phdr->p_type == PT_LOAD)
-                final_file_size = cur_phdr->p_offset + cur_phdr->p_filesz;
-            cur_phdr++;
-        }
-    }
+    
 
     out_file_data = mmap(NULL, final_file_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (out_file_data == NULL || (intptr_t)out_file_data == -1) {
@@ -486,6 +476,12 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
                 sizeof(struct sce_self_header) + (i * sizeof(struct sce_self_segment_header)));
 
         if (SELF_SEGMENT_HAS_DIGESTS(segment)) {
+            uint32_t seg_id = SELF_SEGMENT_ID(segment); // 👈 AÑADIR AQUÍ
+
+            if (seg_id >= header->segment_count) {      // 👈 Y ESTO
+                SOCK_LOG(sock, "[!] segment ID %u out of range\n", seg_id);
+                continue;
+            }
             target_segment = (struct sce_self_segment_header *) (self_file_data +
                 sizeof(struct sce_self_header) + (SELF_SEGMENT_ID(segment) * sizeof(struct sce_self_segment_header)));
             SOCK_LOG(sock, "  [?] decrypting block info segment for %lu\n", SELF_SEGMENT_ID(target_segment));
@@ -507,36 +503,30 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
         }
     }
 
-    /*for (int i = 0; i < header->segment_count; i++) {
-        if (block_segments[i]) {
-            SOCK_LOG(sock, "decrypted info segment for seg=0x%02x (%d blocks)\n", i, block_segments[i]->block_count);
-
-            for (int j = 0; j < block_segments[i]->block_count; j++) {
-                SOCK_LOG(sock, "  block #%04d, extent (offset: 0x%08x, len: 0x%08x), digest:\n",
-                         j,
-                         block_segments[i]->extents[j]->offset,
-                         block_segments[i]->extents[j]->len);
-                DumpHex(sock, (block_segments[i]->data + (j * 0x20)), 0x20);
-            }
-        }
-    }*/
-
     // Decrypt regular blocked-segments to file
     for (int i = 0; i < header->segment_count; i++) {
         segment = (struct sce_self_segment_header *) (self_file_data +
                 sizeof(struct sce_self_header) + (i * sizeof(struct sce_self_segment_header)));
 
-        // Ignore info and non-blocked segments
-        if (!SELF_SEGMENT_HAS_BLOCKS(segment) || SELF_SEGMENT_HAS_DIGESTS(segment)) {
+        // Skip segments that have no actual data blocks (e.g., metadata-only)
+        if (!SELF_SEGMENT_HAS_BLOCKS(segment)) {
+            SOCK_LOG(sock, "  [-] segment %d has no blocks, skipping\n", i);
             continue;
         }
 
         // Get accompanying ELF segment
         cur_phdr = start_phdrs;
+        int phnum;
         for (int phnum = 0; phnum < header->segment_count; phnum++) {
             if (cur_phdr->p_filesz == segment->uncompressed_size)
                 break;
             cur_phdr++;
+        }
+
+        // Verificamos si se encontró algún segmento ELF
+        if (phnum == header->segment_count) {
+            SOCK_LOG(sock, "[!] ELF segment not found for segment %d\n", i);
+            continue;
         }
 
         // Get block info for this segment
@@ -588,10 +578,10 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
 
             munmap(block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
         }
+
     }
 
     SOCK_LOG(sock, "[?] writing decrypted SELF to file...\n");
-    //podria volarlo
     written_bytes = write(out_fd, out_file_data, final_file_size);
     if (written_bytes != final_file_size) {
         SOCK_LOG(sock, "[!] failed to dump to file, %d != %lu (%d).\n", written_bytes, final_file_size, errno);
@@ -650,12 +640,12 @@ int dump_queue_add_file(int sock, char *path)
     int len = strlen(path);
 
     // skip app0, we only want app0-patch0-union
-    if (len >= 35 && strncmp(path, "/mnt/sandbox/pfsmnt/", 20) == 0 && (strncmp(path + 29, "-app0/", 6) == 0 || strncmp(path + 29, "-patch0/", 8) == 0)) {
-#if DEBUG
-        SOCK_LOG(sock, "[!] ignoring app0/patch0: %s\n", path);
-#endif
-        return -1;
-    }
+    // if (len >= 35 && strncmp(path, "/mnt/sandbox/pfsmnt/", 20) == 0 && (strncmp(path + 29, "-app0/", 6) == 0 || strncmp(path + 29, "-patch0/", 8) == 0)) {
+    // #if DEBUG
+    //         SOCK_LOG(sock, "[!] ignoring app0/patch0: %s\n", path);
+    // #endif
+    //     return -1;
+    // }
     
     char* dot = strrchr(path, '.'); // find last dot
     if (dot == NULL) {
@@ -687,13 +677,6 @@ int dump_queue_add_file(int sock, char *path)
     read(fd, &magic, sizeof(magic));
     close(fd);
     
-//     if (magic != SELF_PROSPERO_MAGIC) {
-// // #if DEBUG
-//         SOCK_LOG(sock, "[!] not a PS5 SELF file: %s\n", path);
-// // #endif
-//         return -5;
-//     }
-
     int new_g_dump_queue_buf_pos = g_dump_queue_buf_pos + len + 1;
     if (new_g_dump_queue_buf_pos >= G_DUMP_QUEUE_BUF_SIZE) {
         SOCK_LOG(sock, "[!] dump queue buffer full\n");
@@ -854,6 +837,48 @@ out:
     kernel_copyin(&spinlock_unlock, sbl_sxlock_addr, sizeof(spinlock_unlock));
 
     return err;
+}
+
+int dump_eboot_from_disc(int sock) {
+    DIR *dir;
+    struct dirent *entry;
+    char patch_path[PATH_MAX];
+    char app0_path[PATH_MAX];
+
+    dir = opendir("/mnt/sandbox/pfsmnt");
+    if (dir == NULL) {
+        SOCK_LOG(sock, "[!] failed to open pfsmnt\n");
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            // Primero intentamos con -patch0
+            if (strstr(entry->d_name, "-patch0")) {
+                snprintf(patch_path, sizeof(patch_path), "/mnt/sandbox/pfsmnt/%s/eboot.bin", entry->d_name);
+                SOCK_LOG(sock, "[+] found patch0 eboot: %s\n", patch_path);
+                closedir(dir);
+                return dump_queue_add_file(sock, patch_path);
+            }
+        }
+    }
+
+    rewinddir(dir); // volver a empezar el bucle
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            if (strstr(entry->d_name, "-app0")) {
+                snprintf(app0_path, sizeof(app0_path), "/mnt/sandbox/pfsmnt/%s/eboot.bin", entry->d_name);
+                SOCK_LOG(sock, "[+] found app0 eboot: %s\n", app0_path);
+                closedir(dir);
+                return dump_queue_add_file(sock, app0_path);
+            }
+        }
+    }
+
+    closedir(dir);
+    SOCK_LOG(sock, "[!] no eboot found in patch0 or app0\n");
+    return -2;
 }
 
 int main()
@@ -1052,9 +1077,15 @@ int main()
     // `/mnt/sandbox/pfsmnt/*-app0/` and `/mnt/sandbox/pfsmnt/*-patch0/`
     // i did this so when i pass in `/mnt/sandbox/pfsmnt` it will only dump `/mnt/sandbox/pfsmnt/PPSA01487-app0-patch0-union`
     // bc for ps5 games, `app0` and `app0-patch0-union` has the same files
+    
+    // Para PS4 disco:
+    //dump_queue_add_dir(sock, "/mnt/sandbox/pfsmnt/XXXXXXXX-app0", 1);
+    //dump_queue_add_dir(sock, "/mnt/sandbox/pfsmnt/XXXXXXXX-patch0", 1);
+    //ps5   
+    //dump_queue_add_dir(sock, "/mnt/sandbox/pfsmnt", 1);
+    dump_eboot_from_disc(sock);
 
-    dump_queue_add_dir(sock, "/mnt/sandbox/pfsmnt", 1);
-    dump(sock, authmgr_handle, &offsets, "/data/dump");
+    //dump(sock, authmgr_handle, &offsets, "/data/dump");
 
 out:
 #ifdef LOG_TO_SOCKET
