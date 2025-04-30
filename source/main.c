@@ -216,6 +216,8 @@ struct self_block_segment *self_decrypt_segment(
     // Copy out decrypted content
     kernel_copyout(data_blob_va, out_segment_data, segment->uncompressed_size);
 
+    SOCK_LOG(sock, "[*] bump usage: %lu / %lu\n", (g_bump_allocator_cur - g_bump_allocator_base), g_bump_allocator_len);
+
     // Track segment info for use later
     segment_info = bump_alloc(sizeof(struct self_block_segment));
     if (segment_info == NULL)
@@ -342,8 +344,11 @@ void *self_decrypt_block(
     }
 
     out_block_data = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (out_block_data == NULL)
+    if (out_block_data == NULL || out_block_data == MAP_FAILED) {
+        SOCK_LOG(sock, "[!] mmap failed in self_decrypt_block, errno: %d\n", errno);
         return NULL;
+    }
+    
 
     uint8_t *dbg = (uint8_t *)out_block_data;    
     // Segmented copy out decrypted content
@@ -473,6 +478,8 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
         0x40
     );
 
+    SOCK_LOG(sock, "[*] bump usage before block_segments: %lu / %lu\n", (g_bump_allocator_cur - g_bump_allocator_base), g_bump_allocator_len);
+
     // Allocate array to hold block info
     block_segments = bump_calloc(header->segment_count, sizeof(struct self_block_segment *));
     if (block_segments == NULL) {
@@ -557,6 +564,8 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
             continue;
         }
 
+        SOCK_LOG(sock, "[*] bump usage before block_data alloc: %lu / %lu\n", (g_bump_allocator_cur - g_bump_allocator_base), g_bump_allocator_len);
+
         // Allocate array to hold decrypted block data
         block_data = bump_calloc(block_info->block_count, sizeof(void *));
         if (block_data == NULL) {
@@ -610,6 +619,11 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
                 cur_phdr->p_offset + (block * SELF_SEGMENT_BLOCK_SIZE(segment)),
                 size);
         
+            if (block_data[block] == NULL) {
+                SOCK_LOG(sock, "[!] Skipping block %d due to NULL data\n", block);
+                continue;
+            }
+                    
             memcpy(out_addr, block_data[block], size);
         
             munmap(block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
