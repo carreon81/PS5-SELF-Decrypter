@@ -354,7 +354,6 @@ void *self_decrypt_block(
 
     uint8_t *dbg = (uint8_t *)out_block_data;    
     // Ajustar el tamaño a copiar en el último bloque si es parcial
-    size_t total_size = block_segment->extents[block_idx]->len;
     for (size_t copied = 0; copied < total_size; copied += 0x1000) {
         size_t chunk_size = (total_size - copied < 0x1000) ? (total_size - copied) : 0x1000;
         kernel_copyout(data_out_va + copied, out_block_data + copied, chunk_size);
