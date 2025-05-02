@@ -313,10 +313,12 @@ void *self_decrypt_block(
     // Calculate input address and size
     input_addr = (uint64_t) (file_data + segment->offset + block_segment->extents[block_idx]->offset);
 
-    // Segmented copy into data cave #1
-    for (int i = 0; i < 4; i++) {
-        kernel_copyin((void *) (input_addr + (i * 0x1000)), data_blob_va + (i * 0x1000), 0x1000);
+    size_t total_size = block_segment->extents[block_idx]->len;
+    for (size_t copied = 0; copied < total_size; copied += 0x1000) {
+        size_t chunk_size = (total_size - copied < 0x1000) ? (total_size - copied) : 0x1000;
+        kernel_copyin((void *)(input_addr + copied), data_blob_va + copied, chunk_size);
     }
+    
     
     // Request segment decryption
     for (int tries = 0; tries < 50; tries++) {
@@ -351,9 +353,11 @@ void *self_decrypt_block(
     
 
     uint8_t *dbg = (uint8_t *)out_block_data;    
-    // Segmented copy out decrypted content
-    for (int i = 0; i < 4; i++) {
-        kernel_copyout(data_out_va + (i * 0x1000), out_block_data + (i * 0x1000), 0x1000);
+    // Ajustar el tamaño a copiar en el último bloque si es parcial
+    size_t total_size = block_segment->extents[block_idx]->len;
+    for (size_t copied = 0; copied < total_size; copied += 0x1000) {
+        size_t chunk_size = (total_size - copied < 0x1000) ? (total_size - copied) : 0x1000;
+        kernel_copyout(data_out_va + copied, out_block_data + copied, chunk_size);
     }
 
    
@@ -590,11 +594,15 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
                 block,
                 offsets
             );
-        
+       
             if (block_data[block] == NULL) {
                 SOCK_LOG(sock, "[!] failed to decrypt block %d\n", block);
                 err = -11;
                 goto cleanup_out_file_data;
+            }
+
+            if (block == block_info->block_count - 1) {
+                SOCK_LOG(sock, "[?] Final block in segment %d: tail size = 0x%lx\n", i, tail_block_size);
             }
 
             // DEBUG: Mostrar los primeros 16 bytes del bloque
@@ -620,11 +628,13 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
                 size);
         
             if (block_data[block] == NULL) {
-                SOCK_LOG(sock, "[!] Skipping block %d due to NULL data\n", block);
+                SOCK_LOG(sock, "[!] Skipping block %d due to NULL data — attempting to write zeros\n", block);
+                memset(out_addr, 0, size);  // Escribe ceros para evitar huecos
                 continue;
             }
-                    
+            
             memcpy(out_addr, block_data[block], size);
+                
         
             munmap(block_data[block], SELF_SEGMENT_BLOCK_SIZE(segment));
         }
