@@ -452,7 +452,7 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
 
     for (int i = 0; i < elf_header->e_phnum; i++) {
         if (cur_phdr->p_type == PT_LOAD) {
-            uint64_t end_offset = cur_phdr->p_offset + cur_phdr->p_memsz;;
+            uint64_t end_offset = cur_phdr->p_offset + cur_phdr->p_filesz;
             if (end_offset > final_file_size) {
                 final_file_size = end_offset;
             }
